@@ -1,0 +1,764 @@
+---
+title: "Hedonic Real Estate Valuation Model"
+author: "Malu Sena Gomes da Costa"
+date: January 17 2026
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: false
+---
+
+# Overview
+
+Goal: Predict December 2012 market values for the 191 properties flagged with `predict == 1` in the training data, using only information that would have been available before December 2012.
+
+Implementation:
+
+1. Hedonic regression (log-price) with time and geographic fixed effects
+2. Tree-based model (random forest via `ranger`) to capture non-linearities
+3. Simple validation using November 2012 sales as a holdout set.
+4. Produces a final prediction that uses the hedonic model as a baseline and a random forest trained on the hedonic residuals, and writes a .csv file with a predicted price for each of the 191 homes
+
+---
+
+```{r 00_setup, message=FALSE, warning=FALSE}
+# Install and load packages 
+req_pkgs <- c(
+  "data.table", "dplyr", "stringr", "lubridate", "ggplot2",
+  "fixest", "ranger", "Metrics", "janitor", "readr"
+)
+
+# Install any missing packages
+installed <- rownames(installed.packages())
+for (p in req_pkgs) {
+  if (!p %in% installed) install.packages(p, repos = "https://cloud.r-project.org")
+}
+
+# Load libraries
+library(data.table)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(fixest)
+library(ranger)
+library(Metrics)
+library(janitor)
+library(readr)
+
+# Reproducibility for any random operations (ranger)
+set.seed(123)
+```
+
+# Load data
+
+```{r 01_load}
+# Define file paths (local)
+train_path <- "TrainingData.csv"
+test_path  <- "TestData.csv"
+
+
+# Read .csv files 
+train_raw <- data.table::fread(train_path, na.strings = c("", "NA", "NaN"))
+test_raw  <- data.table::fread(test_path,  na.strings = c("", "NA", "NaN"))
+
+# Clean column names for easier typing
+train_raw <- janitor::clean_names(train_raw)
+test_raw  <- janitor::clean_names(test_raw)
+
+# Inspect the price-missing pattern
+train_raw %>%
+  count(predict, is.na(sale_price)) %>%
+  arrange(predict)
+```
+
+# Parse dates and keep only information available before Dec 2012
+
+```{r 02_dates}
+# Parse transaction_date (formatted as "04feb1983")to Date
+train <- train_raw %>%
+  mutate(
+    transaction_date = parse_date_time(transaction_date, orders = "dby"),
+    transaction_date = as.Date(transaction_date),
+    ym = floor_date(transaction_date, unit = "month")
+  )
+
+# Define information cutoff (start of Dec 2012)
+cutoff_date <- as.Date("2012-12-01")
+
+# Keep 'observed' sales before cutoff for model estimation
+hist_sales <- train %>%
+  filter(!is.na(sale_price), transaction_date < cutoff_date)
+
+# Predict rows are the Dec-2012 sales with predict==1 (price removed)
+predict_rows <- train %>%
+  filter(predict == 1)
+```
+
+# Feature engineering + basic cleaning
+
+- Work in **log price** to reduce outlier influence and stabilize variance
+- Mild winsorization of `sale_price` in the training set to reduce the impact of outliers
+- Convert categorical variables to factors for fixed effects/random forest
+
+```{r 03_features}
+# Winsorization (by quantiles)
+winsor <- function(x, p = 0.01) {
+  lo <- quantile(x, probs = p, na.rm = TRUE)
+  hi <- quantile(x, probs = 1 - p, na.rm = TRUE)
+  pmin(pmax(x, lo), hi)
+}
+
+# Apply preprocessing function consistently
+prep_features <- function(df, train_mode = FALSE) {
+  out <- df %>%
+    mutate(
+      sale_price_w = if (train_mode) winsor(sale_price, p = 0.01) else sale_price,
+      log_price = ifelse(is.na(sale_price_w), NA_real_, log(sale_price_w)),
+
+# Numeric stabilizers (handles zeros)
+      log_impr_sf = log1p(improvement_sf),
+      log_acres   = log1p(total_net_acres),
+      log_gar_sf  = log1p(total_garage_sf),
+      log_fin_bs  = log1p(total_finished_basement_sf),
+      log_unf_bs  = log1p(total_unfinished_basement_sf),
+      log_porch   = log1p(total_porch_sf),
+      log_built_as= log1p(built_as_sf),
+
+# Age variables
+      age = ifelse(!is.na(built_year), year(ym) - built_year, NA_real_),
+      age2 = ifelse(is.na(age), NA_real_, age^2),
+      years_since_remodel = ifelse(!is.na(remodeled_year), year(ym) - remodeled_year, NA_real_),
+
+# Flags to 0/1
+      walkout_basement_flag = ifelse(is.na(walkout_basement_flag), 0, walkout_basement_flag),
+      vacant_flag = ifelse(is.na(vacant_flag), 0, vacant_flag)
+    ) %>%
+    mutate(
+# Factors for categorical variables
+      location_zip_code = as.factor(location_zip_code),
+      city_name = as.factor(city_name),
+      neighborhood_code = as.factor(neighborhood_code),
+      style = as.factor(style),
+      built_as = as.factor(built_as),
+      quality_code = as.factor(quality_code),
+      property_type_code = as.factor(property_type_code),
+      deed_type = as.factor(deed_type),
+      condition = as.factor(condition),
+      hvac = as.factor(hvac),
+      roof_material_code = as.factor(roof_material_code)
+    )
+
+  return(out)
+}
+
+# Apply preprocessing function
+hist_sales_p <- prep_features(hist_sales, train_mode = TRUE)
+predict_rows_p <- prep_features(predict_rows, train_mode = FALSE)
+
+# --- Helper: impute missing model inputs so predictions don't become NA ---
+# Impute numeric predictors using training medians and set missing factor levels to 'Missing'.
+
+num_vars_model <- c(
+  'log_impr_sf','log_acres','no_of_bedroom','no_of_bathroom','age','age2','years_since_remodel',
+  'log_gar_sf','log_fin_bs','log_unf_bs','no_of_fireplace','total_porch_sf',
+  'walkout_basement_flag','sprinkler_coverage_sf','completion_percent'
+)
+
+fac_vars_model <- c(
+  'style','built_as','quality_code','condition','hvac','property_type_code',
+  'location_zip_code','city_name','neighborhood_code'
+)
+
+get_medians <- function(df, vars) {
+  med <- list()
+  for (v in vars) {
+    if (v %in% names(df)) {
+      x <- df[[v]]
+      med[[v]] <- if (all(is.na(x))) 0 else median(x, na.rm = TRUE)
+    }
+  }
+  med
+}
+
+impute_inputs <- function(df, medians, num_vars, fac_vars) {
+  # numeric: median imputation
+  for (v in num_vars) {
+    if (v %in% names(df)) {
+      df[[v]][is.na(df[[v]])] <- medians[[v]]
+    }
+  }
+  # factors: explicit missing level
+  for (v in fac_vars) {
+    if (v %in% names(df)) {
+      x <- as.character(df[[v]])
+      x[is.na(x) | x == ''] <- 'Missing'
+      df[[v]] <- as.factor(x)
+    }
+  }
+  df
+}
+
+# Summary of price distribution in the estimation sample
+summary(hist_sales_p$sale_price_w)
+
+hist(log(train$sale_price),
+     breaks = 60,
+     main = "Histogram of Log Sale Prices",
+     xlab = "log(Sale Price)",
+     border = "white")
+
+```
+
+# Validation split (holdout = November 2012)
+
+```{r 04_split}
+# Define validation window (Nov 2012)
+val_start <- as.Date("2012-11-01")
+val_end   <- as.Date("2012-12-01")
+
+# Split
+train_df <- hist_sales_p %>% filter(transaction_date < val_start)
+val_df   <- hist_sales_p %>% filter(transaction_date >= val_start, transaction_date < val_end)
+
+# Check sizes
+c(n_train = nrow(train_df), n_val = nrow(val_df))
+```
+
+# Model 1: Hedonic regression with fixed effects (FE)
+
+Specification (log price):
+
+- Core characteristics: size, acres, beds/baths, age, basement/garage, quality/condition.
+- Fixed effects: **zip code**, **month**, and **year**, to absorb location/time trends.
+
+```{r 05_hedonic}
+# Create year and month FE variables
+train_df <- data.table::copy(train_df)
+val_df   <- data.table::copy(val_df)
+data.table::setDT(train_df)
+data.table::setDT(val_df)
+
+data.table::set(train_df, j = "year",  value = lubridate::year(train_df$transaction_date))
+data.table::set(train_df, j = "month", value = lubridate::month(train_df$transaction_date))
+
+data.table::set(val_df, j = "year",  value = lubridate::year(val_df$transaction_date))
+data.table::set(val_df, j = "month", value = lubridate::month(val_df$transaction_date))
+
+# Impute missing covariates for stable estimation/prediction
+med_train <- get_medians(train_df, num_vars_model)
+
+# Create target variable (log price)
+# Use winsorized sale price for stability
+train_df <- train_df[!is.na(sale_price_w) & sale_price_w > 0]
+train_df[, log_price := log(sale_price_w)]
+
+# Fix NA issues: years_since_remodel missing in validation (and training)
+# Interpretation: missing remodel info => assume never remodeled => years_since_remodel = age
+train_df[is.na(years_since_remodel) & !is.na(age), years_since_remodel := age]
+val_df[is.na(years_since_remodel)   & !is.na(age), years_since_remodel := age]
+
+# Impute missing inputs (prevents NA predictions)
+medians_train <- get_medians(as.data.frame(train_df), num_vars_model)
+train_df <- as.data.table(impute_inputs(as.data.frame(train_df), medians_train, num_vars_model, fac_vars_model))
+val_df   <- as.data.table(impute_inputs(as.data.frame(val_df),   medians_train, num_vars_model, fac_vars_model))
+# Align factor levels in validation to training
+for (v in fac_vars_model) {
+  if (v %in% names(train_df) && v %in% names(val_df)) {
+    val_df[[v]] <- factor(val_df[[v]], levels = levels(train_df[[v]]))
+  }
+}
+
+# FE hedonic regression (train on pre-Nov 2012)
+hedonic_fe <- feols(
+  log_price ~ log_impr_sf + log_acres + no_of_bedroom + no_of_bathroom + age + age2 + years_since_remodel +
+    log_gar_sf + log_fin_bs + log_unf_bs + no_of_fireplace + total_porch_sf +
+    walkout_basement_flag + sprinkler_coverage_sf + completion_percent +
+    style + built_as + property_type_code + quality_code + condition + hvac |
+    location_zip_code + year + month,
+  data = na.omit(train_df)
+)
+
+# Summarize model
+summary(hedonic_fe, vcov = "hetero")
+
+# Predict on validation set
+val_df[, pred_log_fe := predict(hedonic_fe, newdata = val_df)]
+
+# If validation contains new fixed-effect levels (e.g., ZIP not present in estimation),
+# predict() can return NA. Fall back to prediction without fixed effects for those rows.
+val_pred_log_fe_nofe_m1 <- predict(hedonic_fe, newdata = val_df, fixef = FALSE)
+val_df[, pred_log_fe_safe_m1 := fifelse(is.na(pred_log_fe), val_pred_log_fe_nofe_m1, pred_log_fe)]
+
+# Duan smearing retransformation 
+smear_fe <- mean(exp(resid(hedonic_fe)), na.rm = TRUE)
+if (!is.finite(smear_fe) || is.na(smear_fe)) smear_fe <- 1.0
+val_df[, pred_fe := exp(pred_log_fe_safe_m1) * smear_fe]
+
+# Validation metrics (price level)
+val_eval <- val_df[!is.na(sale_price) & !is.na(pred_fe)]
+rmse_fe <- Metrics::rmse(val_eval$sale_price, val_eval$pred_fe)
+mae_fe  <- Metrics::mae(val_eval$sale_price, val_eval$pred_fe)
+
+cat("Validation RMSE (FE hedonic):", rmse_fe, "\n")
+cat("Validation MAE  (FE hedonic):", mae_fe, "\n")
+```
+
+# Model 2: Random forest on hedonic residuals (RF correction)
+
+Instead of predicting the full log price directly, I use the hedonic fixed-effects model as a structured baseline and then train a random forest to predict the remaining variation (the hedonic residual). This keeps the interpretability of a hedonic model while allowing flexible non-linear corrections.
+
+```{r 06_rf}
+# Select a feature set (stable across train/val/predict)
+# NOTE: Target is the hedonic residual (resid_fe), not log_price.
+# The residual-correction approach is: logP_hat = logP_hat_FE + resid_hat_RF
+rf_vars <- c(
+  "resid_fe",
+  "log_impr_sf", "log_acres", "no_of_bedroom", "no_of_bathroom", "age", "age2", "years_since_remodel",
+  "log_gar_sf", "log_fin_bs", "log_unf_bs", "no_of_fireplace", "total_porch_sf",
+  "walkout_basement_flag", "sprinkler_coverage_sf", "completion_percent",
+  "style", "built_as", "quality_code", "condition", "hvac", "property_type_code",
+  "location_zip_code", "city_name", "neighborhood_code",
+  "year", "month"
+)
+
+# Make sure year/month exist in train_df and val_df (and are factors for RF)
+train_df <- train_df %>%
+  mutate(
+    year  = lubridate::year(transaction_date),
+    month = lubridate::month(transaction_date),
+    year  = as.factor(year),
+    month = as.factor(month)
+  )
+
+val_df <- val_df %>%
+  mutate(
+    year  = lubridate::year(transaction_date),
+    month = lubridate::month(transaction_date),
+    year  = as.factor(year),
+    month = as.factor(month)
+  )
+
+# --- Residual target ---
+# Compute in-sample FE predictions and hedonic residuals on the RF training sample.
+# (RF learns flexible nonlinearities in what the FE model misses.)
+train_df$pred_log_fe_train <- predict(hedonic_fe, newdata = train_df)
+train_df$resid_fe <- train_df$log_price - train_df$pred_log_fe_train
+
+# Validation residual target is not needed for fitting, but combine predictions with FE below.
+
+# Ensure factors in RF data (and keep factor levels consistent)
+rf_train <- train_df %>%
+  dplyr::select(dplyr::all_of(rf_vars)) %>%
+  mutate(
+    location_zip_code = as.factor(location_zip_code),
+    city_name         = as.factor(city_name),
+    neighborhood_code = as.factor(neighborhood_code),
+    style             = as.factor(style),
+    built_as          = as.factor(built_as),
+    quality_code      = as.factor(quality_code),
+    condition         = as.factor(condition),
+    hvac              = as.factor(hvac),
+    property_type_code= as.factor(property_type_code)
+  )
+
+# For validation, build the same feature frame excluding the target
+rf_val <- val_df %>%
+  dplyr::select(dplyr::all_of(rf_vars[-1])) %>%
+  mutate(
+    location_zip_code = as.factor(location_zip_code),
+    city_name         = as.factor(city_name),
+    neighborhood_code = as.factor(neighborhood_code),
+    style             = as.factor(style),
+    built_as          = as.factor(built_as),
+    quality_code      = as.factor(quality_code),
+    condition         = as.factor(condition),
+    hvac              = as.factor(hvac),
+    property_type_code= as.factor(property_type_code)
+  )
+
+# Align factor levels in validation to training (prevents new level issues)
+align_levels <- function(train, val, cols) {
+  for (cc in cols) {
+    train[[cc]] <- as.factor(train[[cc]])
+    val[[cc]]   <- factor(val[[cc]], levels = levels(train[[cc]]))
+  }
+  list(train = train, val = val)
+}
+
+factor_cols <- c(
+  "style","built_as","quality_code","condition","hvac","property_type_code",
+  "location_zip_code","city_name","neighborhood_code","year","month"
+)
+
+lvl <- align_levels(rf_train, rf_val, factor_cols)
+rf_train <- lvl$train
+rf_val   <- lvl$val
+
+# If validation contains unseen factor levels, they become NA after alignment; map them to 'Missing'.
+for (cc in factor_cols) {
+  if (cc %in% names(rf_val)) {
+    x <- as.character(rf_val[[cc]])
+    x[is.na(x) | x == ''] <- 'Missing'
+    rf_val[[cc]] <- factor(x, levels = union(levels(rf_train[[cc]]), 'Missing'))
+    rf_train[[cc]] <- factor(as.character(rf_train[[cc]]), levels = levels(rf_val[[cc]]))
+  }
+}
+
+# Fit random forest on hedonic residuals
+rf_resid_fit <- ranger::ranger(
+  formula = resid_fe ~ .,
+  data = rf_train,
+  num.trees = 1200,
+  mtry = floor(sqrt(ncol(rf_train) - 1)),
+  min.node.size = 5,
+  sample.fraction = 0.8,
+  splitrule = "extratrees",
+  importance = "impurity",
+  respect.unordered.factors = "order",
+  na.action = "na.omit"
+)
+
+# Predict residuals on validation
+val_pred_resid <- predict(rf_resid_fit, data = rf_val)$predictions
+val_pred_resid[is.na(val_pred_resid)] <- 0
+
+# Combine: logP_hat = logP_hat_FE + resid_hat_RF
+# Note: pred_log_fe can be NA if the validation set contains FE levels (e.g., ZIP) not
+# observed in the FE estimation sample. In that case, fall back to the FE prediction
+# without fixed effects so there is still a usable baseline.
+val_pred_log_fe_nofe <- predict(hedonic_fe, newdata = val_df, fixef = FALSE)
+val_df <- val_df %>%
+  mutate(
+    pred_log_fe_safe = ifelse(is.na(pred_log_fe), val_pred_log_fe_nofe, pred_log_fe),
+    pred_log_final   = pred_log_fe_safe + val_pred_resid
+  )
+
+# Duan smearing for the *combined* model (train on pre-Nov 2012)
+# Compute combined in-sample residuals: e = logP - (logP_hat_FE + resid_hat_RF)
+train_pred_resid <- predict(rf_resid_fit, data = rf_train)$predictions
+train_comb_resid <- rf_train$resid_fe - train_pred_resid
+train_comb_resid_cc <- train_comb_resid[is.finite(train_comb_resid)]
+smear_final <- mean(exp(train_comb_resid_cc), na.rm = TRUE)
+if (!is.finite(smear_final) || is.na(smear_final)) smear_final <- 1.0
+
+# Convert to price level (bias-corrected)
+val_df <- val_df %>% mutate(pred_final = exp(pred_log_final) * smear_final)
+
+# Validation metrics (drop rows with missing predictions)
+val_eval2 <- val_df %>% filter(!is.na(sale_price) & !is.na(pred_final))
+rmse_final <- Metrics::rmse(val_eval2$sale_price, val_eval2$pred_final)
+mae_final  <- Metrics::mae(val_eval2$sale_price, val_eval2$pred_final)
+
+cat("Validation rows with NA pred_final:", sum(is.na(val_df$pred_final)), "\n")
+
+cat("Validation RMSE (Residual-corrected FE+RF):", rmse_final, "\n")
+cat("Validation MAE  (Residual-corrected FE+RF):", mae_final, "\n")
+
+# Variable importance (top 15)
+vip <- ranger::importance(rf_resid_fit)
+
+vip_df <- data.frame(
+  feature = names(vip),
+  importance = as.numeric(vip),
+  row.names = NULL
+)
+
+vip_df %>%
+  arrange(desc(importance)) %>%
+  head(15)
+
+```
+
+# Choose a prediction rule + fit on full pre-Dec2012 sample
+
+Refit both models using all observed sales before Dec 2012 (including November 2012), then predict the 191 missing prices.
+
+```{r 07_refit_full}
+# Build the full historical estimation sample (all observed-price sales pre-Dec 2012)
+
+hist_sales_p <- hist_sales_p %>%
+  mutate(
+    # log target (use winsorized price from prep_features() for stability)
+    log_price = log(sale_price_w),
+    # time controls for forecasting-safe FE
+    year  = as.factor(lubridate::year(transaction_date)),
+    month = as.factor(lubridate::month(transaction_date)),
+    # conservative imputation for remodel timing (prevents NA predictions)
+    years_since_remodel = ifelse(is.na(years_since_remodel) & !is.na(age), age, years_since_remodel)
+  )
+
+# Impute missing inputs for full-sample prediction stability
+medians_full <- get_medians(hist_sales_p, num_vars_model)
+hist_sales_p <- impute_inputs(hist_sales_p, medians_full, num_vars_model, fac_vars_model)
+
+
+# Align factor levels to include 'Missing' consistently
+for (v in fac_vars_model) {
+  if (v %in% names(hist_sales_p)) hist_sales_p[[v]] <- as.factor(hist_sales_p[[v]])
+}
+
+# Refit hedonic FE on the full historical sample
+hedonic_fe_full <- feols(
+  log_price ~ log_impr_sf + log_acres + no_of_bedroom + no_of_bathroom + age + age2 + years_since_remodel +
+    log_gar_sf + log_fin_bs + log_unf_bs + no_of_fireplace + total_porch_sf +
+    walkout_basement_flag + sprinkler_coverage_sf + completion_percent +
+    style + built_as + quality_code + condition + hvac |
+    location_zip_code + year + month,
+  data = na.omit(hist_sales_p)
+)
+
+# Compute hedonic residuals for the full sample
+hist_sales_p$pred_log_fe_full <- predict(hedonic_fe_full, newdata = hist_sales_p)
+hist_sales_p$resid_fe <- hist_sales_p$log_price - hist_sales_p$pred_log_fe_full
+
+# Refit RF on hedonic residuals (full historical sample)
+rf_train_full <- hist_sales_p %>%
+  mutate(
+    year  = as.factor(year),
+    month = as.factor(month),
+    location_zip_code = as.factor(location_zip_code),
+    city_name         = as.factor(city_name),
+    neighborhood_code = as.factor(neighborhood_code),
+    style             = as.factor(style),
+    built_as          = as.factor(built_as),
+    quality_code      = as.factor(quality_code),
+    condition         = as.factor(condition),
+    hvac              = as.factor(hvac),
+    property_type_code= as.factor(property_type_code)
+  ) %>%
+  # Use rf_vars from above, but replace target with resid_fe
+  dplyr::select(dplyr::all_of(rf_vars))
+
+rf_resid_fit_full <- ranger::ranger(
+  formula = resid_fe ~ .,
+  data = rf_train_full,
+  num.trees = 1200,
+  mtry = floor(sqrt(ncol(rf_train_full) - 1)),
+  min.node.size = 5,
+  sample.fraction = 0.8,
+  splitrule = "extratrees",
+  importance = "impurity",
+  respect.unordered.factors = "order",
+  na.action = "na.omit"
+)
+
+# Smearing factor for the combined model (full sample)
+train_resid_hat_full <- predict(rf_resid_fit_full, data = rf_train_full)$predictions
+train_comb_resid_full <- rf_train_full$resid_fe - train_resid_hat_full
+train_comb_resid_full_cc <- train_comb_resid_full[is.finite(train_comb_resid_full)]
+smear_final_full <- mean(exp(train_comb_resid_full_cc), na.rm = TRUE)
+if (!is.finite(smear_final_full) || is.na(smear_final_full)) smear_final_full <- 1.0
+
+```
+
+# Predict the 191 December 2012 transactions
+
+```{r 08_predict}
+# Prepare prediction rows (ensure year/month and remodel fix applied, mirroring training)
+
+predict_rows_p <- predict_rows_p %>%
+  mutate(
+    year = as.factor(lubridate::year(transaction_date)),
+    month = as.factor(lubridate::month(transaction_date)),
+    years_since_remodel = ifelse(is.na(years_since_remodel) & !is.na(age), age, years_since_remodel)
+  )
+
+# Impute missing RHS variables using full-sample medians (prevents NA predictions)
+predict_rows_p <- impute_inputs(predict_rows_p, medians_full, num_vars_model, fac_vars_model)
+
+
+# Build RF prediction frame (same features as rf_train_full, excluding the target)
+rf_pred <- predict_rows_p %>%
+  mutate(
+    location_zip_code = as.factor(location_zip_code),
+    city_name = as.factor(city_name),
+    neighborhood_code = as.factor(neighborhood_code),
+    style = as.factor(style),
+    built_as = as.factor(built_as),
+    quality_code = as.factor(quality_code),
+    condition = as.factor(condition),
+    hvac = as.factor(hvac),
+    property_type_code= as.factor(property_type_code)
+  ) %>%
+  dplyr::select(dplyr::all_of(rf_vars[-1]))
+
+# Align factor levels in predict data to training data to avoid "new level" issues
+factor_cols <- c(
+  "style","built_as","quality_code","condition","hvac","property_type_code",
+  "location_zip_code","city_name","neighborhood_code","year","month"
+)
+for (cc in factor_cols) {
+  rf_pred[[cc]] <- factor(rf_pred[[cc]], levels = levels(rf_train_full[[cc]]))
+}
+
+# --- Predictions ---
+# FE baseline predictions (log)
+# If any fixed-effect levels are new (e.g., a ZIP not seen in estimation), `predict` can
+# return NA. Fall back to the prediction without fixed effects for those rows.
+pred_log_fe <- predict(hedonic_fe_full, newdata = predict_rows_p)
+pred_log_fe_nofe <- predict(hedonic_fe_full, newdata = predict_rows_p, fixef = FALSE)
+pred_log_fe_safe <- ifelse(is.na(pred_log_fe), pred_log_fe_nofe, pred_log_fe)
+
+# RF residual predictions (log residual)
+pred_resid_rf <- predict(rf_resid_fit_full, data = rf_pred)$predictions
+pred_resid_rf[is.na(pred_resid_rf)] <- 0
+
+# Combine on log scale
+pred_log_final <- pred_log_fe_safe + pred_resid_rf
+
+# Convert back to price level (bias-corrected)
+smear_fe_full <- mean(exp(resid(hedonic_fe_full)), na.rm = TRUE)
+if (!is.finite(smear_fe_full) || is.na(smear_fe_full)) smear_fe_full <- 1.0
+pred_price_fe    <- exp(pred_log_fe_safe) * smear_fe_full
+pred_price_final <- exp(pred_log_final) * smear_final_full
+
+# Output table
+pred_out <- predict_rows_p %>%
+  transmute(
+    property_id,
+    transaction_date,
+    pred_price_fe = pred_price_fe,
+    pred_price_final = pred_price_final
+  )
+
+# Preview
+pred_out %>% arrange(desc(pred_price_final)) %>% head(10)
+```
+
+# Deliverable CSV + evaluation on the provided test set
+
+The test data contains the true prices for the 191 transactions. I evaluate the final residual-corrected model in price levels.
+
+```{r 09_output_and_eval}
+# Save deliverable (residual-corrected FE + RF is the main prediction)
+write_csv(
+  pred_out %>% select(property_id, pred_price_final),
+  "exercise1_predictions.csv"
+)
+
+# Merge with test and evaluate
+pred_eval <- pred_out %>%
+  mutate(property_id = as.character(property_id)) %>%
+  select(property_id, pred_price_final) %>%
+  left_join(test_raw %>% mutate(property_id = as.character(property_id)) %>% select(property_id, sale_price), by = "property_id") %>%
+  mutate(
+    abs_error = abs(sale_price - pred_price_final),
+    pct_error = abs_error / sale_price
+  )
+
+# Overall metrics (complete cases only)
+pred_eval_cc <- pred_eval %>% filter(!is.na(sale_price), !is.na(pred_price_final))
+c(
+  rmse_final = rmse(pred_eval_cc$sale_price, pred_eval_cc$pred_price_final),
+  mae_final  = mae(pred_eval_cc$sale_price, pred_eval_cc$pred_price_final),
+  mape_final = mean(pred_eval_cc$pct_error, na.rm = TRUE)
+)
+
+# Scatter plot: predicted vs actual
+ggplot(pred_eval, aes(x = sale_price, y = pred_price_final)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0) +
+  scale_x_continuous(labels = scales::dollar) +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    title = "Exercise 1: Predicted vs Actual Sale Prices (Dec 2012)",
+    x = "Actual sale price",
+    y = "Predicted sale price (FE baseline + RF residual correction)"
+  )
+
+# Misses (top 15 by absolute error)
+pred_eval %>%
+  arrange(desc(abs_error)) %>%
+  select(property_id, sale_price, pred_price_final, abs_error, pct_error) %>%
+  head(15)
+```
+
+# Diagnostics
+
+```{r 10_diagnostics, warning=FALSE}
+# Diagnostics on the November 2012 validation set
+# Compare the hedonic FE baseline vs the residual-corrected FE+RF model
+
+val_df <- val_df %>%
+  mutate(
+    resid_fe_level    = sale_price - pred_fe,
+    resid_final_level = sale_price - pred_final
+  )
+
+# Helper
+summ_metrics <- function(df, pred_col, name) {
+  df2 <- df %>% filter(!is.na(sale_price), !is.na(.data[[pred_col]]))
+  actual <- df2$sale_price
+  pred   <- df2[[pred_col]]
+
+  tibble(
+    model = name,
+    n = nrow(df2),
+    RMSE = rmse(actual, pred),
+    MAE  = mae(actual, pred),
+    Correlation = suppressWarnings(cor(actual, pred, use = "complete.obs")),
+    Mean_Actual = mean(actual),
+    Mean_Pred   = mean(pred),
+    Mean_Residual = mean(actual - pred),
+    Median_Residual = median(actual - pred),
+    P10_AbsErr = quantile(abs(actual - pred), 0.10, na.rm = TRUE),
+    P50_AbsErr = quantile(abs(actual - pred), 0.50, na.rm = TRUE),
+    P90_AbsErr = quantile(abs(actual - pred), 0.90, na.rm = TRUE)
+  )
+}
+
+val_summary <- bind_rows(
+  summ_metrics(val_df, "pred_fe",    "FE hedonic (levels, smeared)"),
+  summ_metrics(val_df, "pred_final", "Residual-corrected FE+RF (levels)")
+) %>%
+  mutate(
+    Bias_Ratio = Mean_Pred / Mean_Actual,
+    RMSE_to_Mean = RMSE / Mean_Actual,
+    MAE_to_Mean  = MAE / Mean_Actual
+  ) %>%
+  arrange(RMSE)
+
+print(val_summary)
+
+# RMSE/MAE by actual-price quartile
+val_by_quartile <- val_df %>%
+  filter(!is.na(sale_price), !is.na(pred_final), !is.na(pred_fe)) %>%
+  mutate(q = ntile(sale_price, 4)) %>%
+  group_by(q) %>%
+  summarise(
+    n = n(),
+    RMSE_FE    = rmse(sale_price, pred_fe),
+    MAE_FE     = mae(sale_price, pred_fe),
+    RMSE_FINAL = rmse(sale_price, pred_final),
+    MAE_FINAL  = mae(sale_price, pred_final),
+    Mean_Actual = mean(sale_price),
+    Mean_FE     = mean(pred_fe, na.rm = TRUE),
+    Mean_Final  = mean(pred_final, na.rm = TRUE),
+    Mean_Residual_Final = mean(sale_price - pred_final),
+    .groups = "drop"
+  )
+
+print(val_by_quartile)
+
+# Residual-vs-actual slope check (positive means underpredicting expensive homes)
+quick_bias_check <- val_df %>%
+  filter(!is.na(sale_price), !is.na(pred_final)) %>%
+  mutate(resid_final = sale_price - pred_final) %>%
+  summarise(
+    cor_resid_actual = cor(resid_final, sale_price),
+    cor_resid_pred   = cor(resid_final, pred_final)
+  )
+print(quick_bias_check)
+```
+
+---
+
+# Possible model improvements
+
+- More granular spatial effects (e.g., neighborhood_code) could improve fit but risk overfitting if too sparse.
+- A repeat-sales component (if many homes transact multiple times) could help control for unobserved house quality.
+- Try alternate validation windows (e.g., December 2011) to ensure robustness.
+- Explore separate modeling or tail-adjustment for luxury properties where errors are largest.
+
